@@ -92,20 +92,35 @@ def _normalize_lines(text: str) -> list[str]:
     while i < len(raw):
         line = raw[i]
 
+        # pdfplumber can return:
+        #   09/30/2026 2:49
+        #   INTER RUN L1-DAY-2 2.78 g/dL 911.1669
+        #   PM
+        # Rebuild it as:
+        #   INTER RUN L1-DAY-2 2.78 g/dL 911.1669 09/30/2026 2:49 PM
+        if (
+            re.fullmatch(r"\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}", line)
+            and i + 2 < len(raw)
+            and re.match(r"^(?:INTER\s+RUN|INTRA\s+PRECISION)", raw[i + 1], re.I)
+            and re.fullmatch(r"(?:[AP]M|\d{1,2}:\d{2}\s*[AP]M)", raw[i + 2], re.I)
+        ):
+            suffix = raw[i + 2]
+            lines.append(f"{raw[i + 1]} {line} {suffix}")
+            i += 3
+            continue
+
+        # Also support a standalone date followed by a result row and AM/PM.
         if (
             re.fullmatch(r"\d{2}/\d{2}/\d{4}", line)
             and i + 2 < len(raw)
-            and re.match(
-                r"^(?:INTER\s+RUN|INTRA\s+PRECISION)",
-                raw[i + 1],
-                re.I,
-            )
-            and re.fullmatch(r"\d{1,2}:\d{2}\s*[AP]M", raw[i + 2], re.I)
+            and re.match(r"^(?:INTER\s+RUN|INTRA\s+PRECISION)", raw[i + 1], re.I)
+            and re.fullmatch(r"(?:[AP]M|\d{1,2}: \d{2}\s*[AP]M|\d{1,2}:\d{2}\s*[AP]M)", raw[i + 2], re.I)
         ):
             lines.append(f"{raw[i + 1]} {line} {raw[i + 2]}")
             i += 3
             continue
 
+        # If the row already ends with a date and the time is on the next line.
         if (
             re.search(r"\d{2}/\d{2}/\d{4}$", line)
             and i + 1 < len(raw)
