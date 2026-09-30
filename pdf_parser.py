@@ -32,12 +32,29 @@ ANALYTE_ANCHOR = re.compile(r"Order\s*Time:.*Analyzer:\s*All", re.IGNORECASE)
 SKIP_ANALYTES = {"H", "I", "L"}
 
 # Siemens/Atellica Assay Report analyte headings, e.g. ALB_A, CAAZ_A.
-ASSAY_ANALYTE_RE = re.compile(r"^[A-Z][A-Z0-9_]*_A$")
+ASSAY_ANALYTE_RE = re.compile(r"^[^\n]{1,80}$")
+
+def _looks_like_assay_heading(lines, idx):
+    """Detect the analyte/title row by its table-header context, not its name.
+
+    Siemens reports can use different analyte names (and may include spaces,
+    hyphens, digits, parentheses, etc.). The stable signal is that the name is
+    immediately followed by the Patient Name / SID / Result table header.
+    """
+    if idx + 1 >= len(lines):
+        return False
+    nxt = lines[idx + 1].strip()
+    if re.search(r"\bPatient\s+Name\b", nxt, re.I) and re.search(r"\bResult\b", nxt, re.I):
+        return True
+    if idx + 2 < len(lines) and re.search(r"\bPatient\s+Name\b", lines[idx + 2], re.I) and re.search(r"\bResult\b", lines[idx + 2], re.I):
+        return True
+    return False
 
 # New Inter rows:
 # INTER RUN DAY-1 4.01 g/dL 1129.6625 09/29/2026 10:38 PM
 INTER_ROW_RE = re.compile(
-    r"^INTER\s+RUN\s+DAY\s*-\s*(\d+)\s+"
+    r"^INTER\s+RUN\s+"
+    r"(?:L\s*(\d+)\s*-\s*)?DAY\s*-\s*(\d+)\s+"
     r"([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s+"
     r"([A-Za-zµμ%]+(?:/[A-Za-zµμ%]+)?)\s+"
     r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)\s+"
@@ -49,7 +66,8 @@ INTER_ROW_RE = re.compile(
 # New Intra rows:
 # INTRA PRECISION L-1 4.00 g/dL 1129.1108 09/29/2026 9:59 PM
 INTRA_ROW_RE = re.compile(
-    r"^INTRA\s+PRECISION\s+L\s*-\s*(\d+)\s+"
+    r"^INTRA\s+(?:PRECISION\s+)?"
+    r"L\s*-?\s*(\d+)\s*(?:-\s*DAY\s*-\s*(\d+))?\s+"
     r"([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s+"
     r"([A-Za-zµμ%]+(?:/[A-Za-zµμ%]+)?)\s+"
     r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)\s+"
@@ -94,43 +112,65 @@ def extract_text_from_pdf(file) -> str:
 
 
 def _normalize_lines(text: str) -> list[str]:
+    """Normalize Siemens table extraction where date/time may be reordered/split."""
     raw = [line.strip() for line in text.splitlines() if line.strip()]
     lines: list[str] = []
     i = 0
+
+    is_date = lambda x: bool(re.fullmatch(r"\d{2}/\d{2}/\d{4}", x))
+    is_time = lambda x: bool(re.fullmatch(r"\d{1,2}:\d{2}\s*[AP]M", x, re.I))
+    is_inter = lambda x: bool(re.match(r"^INTER\s+RUN\b", x, re.I))
+    is_intra = lambda x: bool(re.match(r"^INTRA\s+(?:PRECISION\s+)?\b", x, re.I))
+
     while i < len(raw):
         line = raw[i]
 
-        # Siemens report tables can split one result row across three text
-        # lines: DATE, the INTER/INTRA result row, then TIME. Reconstruct it.
+        # Common pdfplumber order for this report:
+        # DATE TIME -> RESULT ROW -> AM/PM
         if (
-            re.fullmatch(r"\d{2}/\d{2}/\d{4}", line)
-            and i + 2 < len(raw)
-            and re.match(r"^(?:INTER\s+RUN\s+DAY|INTRA\s+PRECISION\s+L)", raw[i + 1], re.I)
-            and re.fullmatch(r"\d{1,2}:\d{2}\s*[AP]M", raw[i + 2], re.I)
+            i + 2 < len(raw)
+            and re.fullmatch(r"\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}", line)
+            and (is_inter(raw[i+1]) or is_intra(raw[i+1]))
+            and re.fullmatch(r"(?:AM|PM)", raw[i+2], re.I)
         ):
-            lines.append(f"{raw[i + 1]} {line} {raw[i + 2]}")
+            lines.append(f"{raw[i+1]} {line} {raw[i+2]}")
             i += 3
             continue
 
-        # Also support the opposite/common case where date/time are attached
-        # to the result row and only the time is split to the next line.
+        # DATE -> RESULT ROW -> AM/PM
+        if i + 2 < len(raw) and is_date(line) and (is_inter(raw[i+1]) or is_intra(raw[i+1])) and is_time(raw[i+2]):
+            lines.append(f"{raw[i+1]} {line} {raw[i+2]}")
+            i += 3
+            continue
+
+        # Other extraction order:
+        # RESULT ROW -> DATE -> AM/PM
+        if i + 2 < len(raw) and (is_inter(line) or is_intra(line)) and is_date(raw[i+1]) and is_time(raw[i+2]):
+            lines.append(f"{line} {raw[i+1]} {raw[i+2]}")
+            i += 3
+            continue
+
+        # Same-line date followed by split AM/PM.
         if (
-            re.search(r"\d{2}/\d{2}/\d{4}$", line)
-            and i + 1 < len(raw)
-            and re.fullmatch(r"\d{1,2}:\d{2}\s*[AP]M", raw[i + 1], re.I)
+            i + 1 < len(raw)
+            and (is_inter(line) or is_intra(line))
+            and re.search(r"\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}$", line)
+            and is_time(raw[i+1])
         ):
-            line += " " + raw[i + 1]
-            i += 1
+            lines.append(line + " " + raw[i+1])
+            i += 2
+            continue
 
         lines.append(line)
         i += 1
+
     return lines
 
 
 def _is_new_assay_report(text: str) -> bool:
     return bool(
-        re.search(r"\bINTER\s+RUN\s+DAY\s*-\s*\d+", text, re.I)
-        or re.search(r"\bINTRA\s+PRECISION\s+L\s*-\s*\d+", text, re.I)
+        re.search(r"\bINTER\s+RUN\s+(?:L\s*\d+\s*-\s*)?DAY\s*-\s*\d+", text, re.I)
+        or re.search(r"\bINTRA\s+(?:PRECISION\s+)?L\s*-?\s*\d+", text, re.I)
     )
 
 
@@ -149,9 +189,9 @@ def _parse_new_assay_report(text: str, precision_type: str) -> list[ParsedResult
     current_analyte = ""
     rep_counter: dict[tuple[str, int, str], int] = {}
 
-    for line in lines:
-        if ASSAY_ANALYTE_RE.fullmatch(line):
-            current_analyte = line
+    for idx, line in enumerate(lines):
+        if _looks_like_assay_heading(lines, idx):
+            current_analyte = line.strip()
             continue
 
         if precision_type.lower() == "inter":
@@ -159,11 +199,13 @@ def _parse_new_assay_report(text: str, precision_type: str) -> list[ParsedResult
             if not match or not current_analyte:
                 continue
 
-            day = int(match.group(1))
-            value = float(match.group(2))
-            unit = match.group(3)
-            date = match.group(4)
-            key = (current_analyte, day, "inter")
+            explicit_level = match.group(1)
+            day = int(match.group(2))
+            value = float(match.group(3))
+            unit = match.group(4)
+            date = match.group(5)
+            level = int(explicit_level) if explicit_level else 1
+            key = (current_analyte, day, f"inter-L{level}")
             replication = rep_counter.get(key, 0) + 1
             rep_counter[key] = replication
 
@@ -174,7 +216,7 @@ def _parse_new_assay_report(text: str, precision_type: str) -> list[ParsedResult
             results.append(
                 ParsedResult(
                     analyte_name=current_analyte,
-                    level=day,
+                    level=level,
                     day_number=day,
                     replication=replication,
                     precision_type="inter",
@@ -190,9 +232,9 @@ def _parse_new_assay_report(text: str, precision_type: str) -> list[ParsedResult
                 continue
 
             level = int(match.group(1))
-            value = float(match.group(2))
-            unit = match.group(3)
-            date = match.group(4)
+            value = float(match.group(3))
+            unit = match.group(4)
+            date = match.group(5)
             key = (current_analyte, level, "intra")
             replication = rep_counter.get(key, 0) + 1
             rep_counter[key] = replication
